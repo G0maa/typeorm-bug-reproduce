@@ -1,73 +1,92 @@
 import { DataSource, Equal } from "typeorm";
-import { Brand, BrandProperty } from "./entities.js";
+import { Brand } from "./entities.js";
+import { randomUUID } from "crypto";
 
 const orm = new DataSource({
-    type: "mysql",
-    host: "localhost",
-    port: 3306,
-    username: "root",
-    password: "rootpassword",
-    database: "testdb",
+    type: "postgres",
+    url: process.env.DATABASE_URI,
     synchronize: true,
-    // logging: true,
-    entities: [Brand, BrandProperty],
+    logging: true,
+    entities: [Brand],
+    // cache: true NOTE: Enable to fail
 });
 
 await orm.initialize();
 
-/**
- * After the transaction is committed, the brand and brand property are inserted into the database correctly.
- * Brand has id 1 and brand property has id 1 with foreign key brandId set to 1.
- *
- * Database after transaction is committed:
- * Brand
- * | id |
- * | 1  |
- *
- * BrandProperty
- * | id | brandId |
- * | 1  | 1       |
- */
+// Test timestamp: using a specific date for comparison
+const testDate = new Date('2024-11-23T10:30:00.123Z');
+console.log('Original test date:', testDate.toISOString());
 
+// Insert a record with both timestamp types
+let insertedId: string = randomUUID();
 await orm.createEntityManager().transaction(async (transaction) => {
     const brand = new Brand();
-    await transaction.insert(Brand, brand);
-
-    const brandProperty = new BrandProperty();
-    brandProperty.brand = brand;
-    await transaction.insert(BrandProperty, brandProperty);
+    brand.timestamptz = testDate;
+    brand.timestampWithTimezone = testDate;
+    const result = await transaction.save(Brand, brand);
+    insertedId = result.id;
+    console.log('\n✅ Inserted Brand with id:', insertedId);
 });
 
-/**
- * To prove that automated cascading will NULL the foreign key of the brand property we simply read the brand and save the brand.
- * Expected result: Only brand should be affected by updated without cascading to the brand property.
- * Actual result: Brand property is also updated (cascade) with foreign key brandId set to NULL.
- *
- * Database after transaction is committed:
- * Brand
- * | id |
- * | 1  |
- *
- * BrandProperty
- * | id | brandId |
- * | 1  | NULL    |
- *
- * Note: If we define { nullable: false } to our ManyToOne relation at BrandProperty->brand,
- * the database will throw an error when trying to save the brand, caused by the updated foreign key brandId of BrandProperty.
- */
-await orm.createEntityManager().transaction(async (transaction) => {
-    const brand = await transaction.findOne(Brand, {
-        where: { id: Equal("1") },
-        relations: { properties: true },
-    });
-
-    if (!brand) {
-        throw new Error("Brand not found");
-    }
-
-    // Save will trigger cascade and setting foreign key brandId of BrandProperty to NULL.
-    await transaction.save(Brand, brand);
+// Test 1: First query (should hit database and populate cache)
+console.log('\n--- Test 1: First Query (Cache Miss) ---');
+const firstQuery = await orm.getRepository(Brand).findOne({
+    where: { id: insertedId },
+    // cache: true NOTE: Enable to fail
 });
 
-console.log("END!")
+if (!firstQuery) {
+    throw new Error("Brand not found");
+}
+
+console.log('timestamptz:', firstQuery.timestamptz.toISOString());
+console.log('timestampWithTimezone:', firstQuery.timestampWithTimezone.toISOString());
+
+// Test 2: Second query (should hit cache)
+console.log('\n--- Test 2: Second Query (Cache Hit) ---');
+const secondQuery = await orm.getRepository(Brand).findOne({
+    where: { id: insertedId },
+    // cache: true NOTE: Enable to fail
+});
+
+if (!secondQuery) {
+    throw new Error("Brand not found");
+}
+
+console.log('timestamptz:', secondQuery.timestamptz.toISOString());
+console.log('timestampWithTimezone:', secondQuery.timestampWithTimezone.toISOString());
+
+// Test 3: Verify persistence/hydration - both columns should be Date objects
+console.log('\n--- Test 3: Verify Persistence/Hydration ---');
+console.log('timestamptz is Date:', secondQuery.timestamptz instanceof Date);
+console.log('timestampWithTimezone is Date:', secondQuery.timestampWithTimezone instanceof Date);
+console.log('timestamptz time matches original:', secondQuery.timestamptz.getTime() === testDate.getTime());
+console.log('timestampWithTimezone time matches original:', secondQuery.timestampWithTimezone.getTime() === testDate.getTime());
+
+// Test 4: Compare both column types - should be identical
+console.log('\n--- Test 4: Compare Column Types ---');
+console.log('ISO strings are identical:',
+    secondQuery.timestamptz.toISOString() === secondQuery.timestampWithTimezone.toISOString());
+console.log('Timestamps are identical:',
+    secondQuery.timestamptz.getTime() === secondQuery.timestampWithTimezone.getTime());
+console.log('Objects are equal:',
+    JSON.stringify(secondQuery.timestamptz) === JSON.stringify(secondQuery.timestampWithTimezone));
+
+// Test 5: Third query without cache to verify database persistence
+console.log('\n--- Test 5: Query Without Cache ---');
+const noCacheQuery = await orm.getRepository(Brand).findOne({
+    where: { id: insertedId },
+    cache: false
+});
+
+if (!noCacheQuery) {
+    throw new Error("Brand not found");
+}
+
+console.log('timestamptz (no cache):', noCacheQuery.timestamptz.toISOString());
+console.log('timestampWithTimezone (no cache):', noCacheQuery.timestampWithTimezone.toISOString());
+console.log('Matches cached result:',
+    noCacheQuery.timestamptz.getTime() === secondQuery.timestamptz.getTime());
+
+console.log("\n✅ All tests completed!")
 await orm.destroy();
